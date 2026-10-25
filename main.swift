@@ -1,4 +1,5 @@
 import AppKit
+import IOKit
 import ServiceManagement
 
 // MARK: - 数据采集
@@ -50,6 +51,61 @@ func readDisk() -> DiskInfo {
     return DiskInfo(used: t > f ? t - f : 0, total: t)
 }
 
+// MARK: - 功耗（读取 SMC 传感器，无需 root）
+
+/// 与 AppleSMC 用户态接口交换的 80 字节结构体，布局必须与内核一致
+private struct SMCParam {
+    struct Vers { var major: UInt8 = 0, minor: UInt8 = 0, build: UInt8 = 0, reserved: UInt8 = 0; var release: UInt16 = 0 }
+    struct PLimit { var version: UInt16 = 0, length: UInt16 = 0; var cpu: UInt32 = 0, gpu: UInt32 = 0, mem: UInt32 = 0 }
+    struct KeyInfo { var dataSize: UInt32 = 0, dataType: UInt32 = 0; var dataAttributes: UInt8 = 0 }
+    var key: UInt32 = 0
+    var vers = Vers()
+    var pLimit = PLimit()
+    var keyInfo = KeyInfo()
+    var padding: UInt16 = 0
+    var result: UInt8 = 0, status: UInt8 = 0, data8: UInt8 = 0
+    var data32: UInt32 = 0
+    var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+}
+
+final class SMC {
+    private var conn: io_connect_t = 0
+
+    init?() {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard IOServiceOpen(service, mach_task_self_, 0, &conn) == kIOReturnSuccess else { return nil }
+    }
+
+    deinit { IOServiceClose(conn) }
+
+    private func call(_ input: inout SMCParam) -> SMCParam? {
+        var output = SMCParam()
+        var size = MemoryLayout<SMCParam>.stride
+        let r = IOConnectCallStructMethod(conn, 2, &input, MemoryLayout<SMCParam>.stride, &output, &size)
+        return r == kIOReturnSuccess && output.result == 0 ? output : nil
+    }
+
+    /// 读取一个 flt 类型的 key，例如 PSTR（整机总功耗，单位 W）
+    func readFloat(_ key: String) -> Double? {
+        let code = key.utf8.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+        var info = SMCParam()
+        info.key = code
+        info.data8 = 9 // 读取 key 信息
+        guard let i = call(&info), i.keyInfo.dataSize == 4 else { return nil }
+        var read = SMCParam()
+        read.key = code
+        read.keyInfo.dataSize = 4
+        read.data8 = 5 // 读取数值
+        guard let o = call(&read) else { return nil }
+        let value = withUnsafeBytes(of: o.bytes) { $0.load(as: Float.self) }
+        return value.isFinite ? Double(value) : nil
+    }
+}
+
 // MARK: - 格式化
 
 func gb(_ bytes: UInt64, decimal: Bool) -> String {
@@ -83,9 +139,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let memDetail = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let diskDetail = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let powerDetail = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let powerItem = NSMenuItem(title: "显示主机功耗", action: #selector(togglePower), keyEquivalent: "")
     private let percentItem = NSMenuItem(title: "显示百分比", action: #selector(setPercent), keyEquivalent: "")
     private let sizeItem = NSMenuItem(title: "显示 已用/总量", action: #selector(setSize), keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "开机自动启动", action: #selector(toggleLogin), keyEquivalent: "")
+
+    private let smc = SMC()
+    private var smoothedPower: Double?   // 指数平滑，避免数字每次刷新都大幅跳动
+    private var powerSum = 0.0
+    private var powerSamples = 0
+
+    private var showPower: Bool {
+        get { UserDefaults.standard.object(forKey: "showPower") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "showPower"); refresh() }
+    }
 
     private var mode: DisplayMode {
         get { DisplayMode(rawValue: UserDefaults.standard.integer(forKey: "displayMode2")) ?? .size }
@@ -98,10 +166,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(memDetail)
         menu.addItem(diskDetail)
+        menu.addItem(powerDetail)
         menu.addItem(.separator())
-        for item in [percentItem, sizeItem, loginItem] { item.target = self }
+        for item in [percentItem, sizeItem, powerItem, loginItem] { item.target = self }
         menu.addItem(percentItem)
         menu.addItem(sizeItem)
+        menu.addItem(powerItem)
         menu.addItem(.separator())
         menu.addItem(withTitle: "打开活动监视器", action: #selector(openActivityMonitor), keyEquivalent: "").target = self
         menu.addItem(loginItem)
@@ -119,6 +189,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refresh() {
         let mem = readMemory()
         let disk = readDisk()
+        // PSTR：整机（主机）总功耗；部分机型没有时退回 PDTR（直流输入功率）
+        if let w = smc?.readFloat("PSTR") ?? smc?.readFloat("PDTR"), w > 0 {
+            smoothedPower = smoothedPower.map { $0 * 0.5 + w * 0.5 } ?? w
+            powerSum += w
+            powerSamples += 1
+        }
 
         let memText: String
         let diskText: String
@@ -140,11 +216,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         title.append(symbol("internaldrive", fallback: "储存"))
         title.append(gauge(disk.ratio))
         title.append(NSAttributedString(string: " \(diskText)", attributes: [.font: font, .foregroundColor: color(disk.ratio)]))
+        if showPower, let w = smoothedPower {
+            title.append(NSAttributedString(string: "   ", attributes: [.font: font]))
+            title.append(symbol("bolt.fill", fallback: "功耗"))
+            title.append(NSAttributedString(string: String(format: " %.1fW", w), attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
+        }
         statusItem.button?.attributedTitle = title
         statusItem.button?.toolTip = "内存 \(pct(mem.ratio)) · 储存 \(pct(disk.ratio))"
 
         memDetail.title = "内存：\(gb(mem.used, decimal: false)) / \(gb(mem.total, decimal: false))（\(pct(mem.ratio))）"
         diskDetail.title = "储存：\(gb(disk.used, decimal: true)) / \(gb(disk.total, decimal: true))（\(pct(disk.ratio))），剩余 \(gb(disk.total - disk.used, decimal: true))"
+        if let w = smoothedPower, powerSamples > 0 {
+            powerDetail.title = String(format: "主机功耗：%.1f W（本次运行平均 %.1f W，不含显示器）", w, powerSum / Double(powerSamples))
+        } else {
+            powerDetail.title = "主机功耗：此机型无法读取"
+        }
+        powerItem.state = showPower ? .on : .off
         percentItem.state = mode == .percent ? .on : .off
         sizeItem.state = mode == .size ? .on : .off
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -192,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func setPercent() { mode = .percent }
     @objc private func setSize() { mode = .size }
+    @objc private func togglePower() { showPower.toggle() }
 
     @objc private func openActivityMonitor() {
         NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app"))
